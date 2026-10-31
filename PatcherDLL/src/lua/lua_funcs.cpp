@@ -1752,9 +1752,132 @@ static int lua_GameExt_SuppressMovement(lua_State* L)
    return 0;
 }
 
+// -----------------------------------------------------------------------------
+// GameExt_SetHudEvent(name, value [, type]) -- drive a HUD event by name so a
+// .hud element bound to it reacts at runtime. This is the Helldivers stratagem
+// arrow row's backbone: Lua lights and dims arrows as the WASD code is typed.
+//
+//   type (string, optional):
+//     "bool"  (default) -- a notification; drives EventEnable / EventDisable.
+//     "float"           -- drives EventAlpha / EventValue. value is a number.
+//     "uint"            -- drives EventBitmap (a texture hash) and the like.
+//
+// TIMING MATTERS. A .hud element's EventEnable binding only *finds* its
+// EventClass at load time -- Steam's ReadEvent falls straight through on a null
+// FindByHashID and never registers the handler (docs/RE/HUDEventBindings.md
+// 1.3/1.4). So each event must EXIST before the .hud that binds it is read:
+// call this once per event in ScriptInit, BEFORE the ReadDataFile of your .hud
+// lvl (value can be 0), to create it; later calls just send to it. The first
+// call runs EventClass::Create (valid any time after HUD::GameEvents::Open, which
+// precedes ScriptInit); subsequent calls FindByHashID and Send.
+//
+// Returns true if sent, nil on a wrong build, outside a live HUD, or when the
+// name already exists with a different event type.
+namespace {
+
+constexpr int      kHudTypeBool  = 1;      // HUD::EventClass::Type values
+constexpr int      kHudTypeUint  = 3;
+constexpr int      kHudTypeFloat = 4;
+constexpr uint32_t kHudEC_Type   = 0x04;   // EventClass::mType offset
+
+using HudFind     = void*(__cdecl*)(uint32_t hash);
+using HudFindFast = void*(__fastcall*)(uint32_t hash);
+using HudCreate   = void*(__cdecl*)(int type, const char* fmt, ...);
+using HudSend     = void(__fastcall*)(void* ev, void* edx);
+
+bool        s_hudEvTried  = false;
+bool        s_hudEvOk     = false;
+HudFind     s_hudFind     = nullptr;
+HudFindFast s_hudFindFast = nullptr;
+HudCreate   s_hudCreate   = nullptr;
+HudSend     s_hudSend     = nullptr;
+
+void hud_events_resolve()
+{
+   if (s_hudEvTried) return;
+   s_hudEvTried = true;
+   if (g_build != GameBuild::Modtools && g_build != GameBuild::Steam && g_build != GameBuild::GOG)
+      return;
+   if (!g_addr->hud_event_class_create || !g_addr->hud_event_class_find || !g_addr->hud_event_send)
+      return;
+   const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+   // FindByHashID: hash on the stack on modtools (cdecl), in ECX on retail (fastcall).
+   void* find = resolve(base, g_addr->hud_event_class_find);
+   if (g_build == GameBuild::Modtools) s_hudFind     = (HudFind)find;
+   else                                s_hudFindFast = (HudFindFast)find;
+   s_hudCreate = (HudCreate)resolve(base, g_addr->hud_event_class_create);
+   s_hudSend   = (HudSend)  resolve(base, g_addr->hud_event_send);
+   s_hudEvOk = s_hudCreate && s_hudSend && (s_hudFind || s_hudFindFast);
+}
+
+void* hud_find_event(uint32_t hash)
+{
+   if (s_hudFind)     return s_hudFind(hash);
+   if (s_hudFindFast) return s_hudFindFast(hash);
+   return nullptr;
+}
+
+// Find the EventClass for name, creating it with this type if absent. Returns
+// null if it already exists with a different type (a send would be misread).
+void* hud_find_or_create(int type, const char* name)
+{
+   void* cls = hud_find_event(pbl_hash(name));
+   if (!cls) return s_hudCreate(type, "%s", name);   // literal name via the fmt
+   if (*(const uint32_t*)((const uint8_t*)cls + kHudEC_Type) != (uint32_t)type)
+      return nullptr;
+   return cls;
+}
+
+void hud_send_event(void* cls, uint32_t data)
+{
+   if (!cls) return;
+   struct { void* mClass; uint32_t mData; } ev = { cls, data };
+   s_hudSend(&ev, nullptr);
+}
+
+} // namespace
+
+static int lua_GameExt_SetHudEvent(lua_State* L)
+{
+   const char* name = g_lua.tolstring(L, 1, nullptr);
+   if (!name || !*name) { g_lua.pushnil(L); return 1; }
+
+   hud_events_resolve();
+   if (!s_hudEvOk) { g_lua.pushnil(L); return 1; }
+
+   const char* typeStr = g_lua.tolstring(L, 3, nullptr);
+   int      type = kHudTypeBool;
+   uint32_t data = 0;
+   if (typeStr && (*typeStr == 'f' || *typeStr == 'F')) {
+      type = kHudTypeFloat;
+      const float v = g_lua.isnumber(L, 2) ? (float)g_lua.tonumber(L, 2) : 0.0f;
+      memcpy(&data, &v, sizeof data);
+   } else if (typeStr && (*typeStr == 'u' || *typeStr == 'U')) {
+      type = kHudTypeUint;
+      data = (uint32_t)(g_lua.isnumber(L, 2) ? g_lua.tointeger(L, 2) : 0);
+   } else {
+      type = kHudTypeBool;   // notification; data is the flag the engine carries
+      int on = 1;
+      if (g_lua.isnumber(L, 2))      on = (g_lua.tonumber(L, 2) != 0) ? 1 : 0;
+      else if (g_lua.gettop(L) >= 2) on = g_lua.toboolean(L, 2) ? 1 : 0;
+      data = (uint32_t)on;
+   }
+
+   int ok = 0;
+   __try {
+      void* cls = hud_find_or_create(type, name);
+      if (cls) { hud_send_event(cls, data); ok = 1; }
+   } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+
+   if (ok) g_lua.pushboolean(L, 1);
+   else    g_lua.pushnil(L);
+   return 1;
+}
+
 static const lua_func_entry custom_functions[] = {
    { "GameExt_KeyDown",         lua_GameExt_KeyDown },
    { "GameExt_SuppressMovement", lua_GameExt_SuppressMovement },
+   { "GameExt_SetHudEvent",     lua_GameExt_SetHudEvent },
    { "ContentCensus",         lua_ContentCensus },
    { "GetMissionName",        lua_GetMissionName },
    { "HttpGet",               lua_HttpGet },
