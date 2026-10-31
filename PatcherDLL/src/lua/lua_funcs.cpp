@@ -1761,6 +1761,11 @@ static int lua_GameExt_SuppressMovement(lua_State* L)
 //     "bool"  (default) -- a notification; drives EventEnable / EventDisable.
 //     "float"           -- drives EventAlpha / EventValue. value is a number.
 //     "uint"            -- drives EventBitmap (a texture hash) and the like.
+//     "color"           -- drives EventColor. value is a packed 0xRRGGBBAA integer.
+//                          type_Color (7) carries a POINTER to 4 colour bytes which
+//                          the handler stores and derefs each frame, so we keep a
+//                          persistent per-event buffer (hud_color_buffer) alive for
+//                          the mission; re-sending the same name updates its colour.
 //
 // TIMING MATTERS. A .hud element's EventEnable binding only *finds* its
 // EventClass at load time -- Steam's ReadEvent falls straight through on a null
@@ -1778,6 +1783,7 @@ namespace {
 constexpr int      kHudTypeBool  = 1;      // HUD::EventClass::Type values
 constexpr int      kHudTypeUint  = 3;
 constexpr int      kHudTypeFloat = 4;
+constexpr int      kHudTypeColor = 7;      // type_Color: mData is a RedColor* (4 bytes)
 constexpr uint32_t kHudEC_Type   = 0x04;   // EventClass::mType offset
 
 using HudFind     = void*(__cdecl*)(uint32_t hash);
@@ -1835,6 +1841,27 @@ void hud_send_event(void* cls, uint32_t data)
    s_hudSend(&ev, nullptr);
 }
 
+// Persistent colour storage for type_Color events. The HUD::Event RedColor ctor
+// stores the POINTER we pass and every EventColor handler dereferences it each
+// frame, so the 4 bytes must outlive the send. One buffer per event name (keyed
+// by its pbl hash); re-sending the same name rewrites its 4 bytes in place.
+struct HudColorSlot { uint32_t hash; uint8_t rgba[4]; bool used; };
+HudColorSlot s_hudColorSlots[32] = {};
+
+uint8_t* hud_color_buffer(uint32_t hash)
+{
+   for (int i = 0; i < 32; ++i)
+      if (s_hudColorSlots[i].used && s_hudColorSlots[i].hash == hash)
+         return s_hudColorSlots[i].rgba;
+   for (int i = 0; i < 32; ++i)
+      if (!s_hudColorSlots[i].used) {
+         s_hudColorSlots[i].used = true;
+         s_hudColorSlots[i].hash = hash;
+         return s_hudColorSlots[i].rgba;
+      }
+   return s_hudColorSlots[0].rgba;   // table full: reuse slot 0 rather than crash
+}
+
 } // namespace
 
 static int lua_GameExt_SetHudEvent(lua_State* L)
@@ -1855,6 +1882,17 @@ static int lua_GameExt_SetHudEvent(lua_State* L)
    } else if (typeStr && (*typeStr == 'u' || *typeStr == 'U')) {
       type = kHudTypeUint;
       data = (uint32_t)(g_lua.isnumber(L, 2) ? g_lua.tointeger(L, 2) : 0);
+   } else if (typeStr && (*typeStr == 'c' || *typeStr == 'C')) {
+      // value is a packed 0xRRGGBBAA colour; stash the 4 bytes in a persistent
+      // per-event buffer and carry its pointer as the event data (see note above).
+      type = kHudTypeColor;
+      const uint32_t packed = (uint32_t)(g_lua.isnumber(L, 2) ? g_lua.tointeger(L, 2) : 0);
+      uint8_t* buf = hud_color_buffer(pbl_hash(name));
+      buf[0] = (uint8_t)((packed >> 24) & 0xFF);   // R
+      buf[1] = (uint8_t)((packed >> 16) & 0xFF);   // G
+      buf[2] = (uint8_t)((packed >>  8) & 0xFF);   // B
+      buf[3] = (uint8_t)( packed        & 0xFF);   // A
+      data = (uint32_t)(uintptr_t)buf;
    } else {
       type = kHudTypeBool;   // notification; data is the flag the engine carries
       int on = 1;
