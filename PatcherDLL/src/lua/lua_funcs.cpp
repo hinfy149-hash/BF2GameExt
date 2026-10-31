@@ -1723,7 +1723,22 @@ static int lua_GetMissionName(lua_State* L)
    return 1;
 }
 
+// GameExt_KeyDown(vk): physical state of a keyboard key (Win32 Virtual-Key code).
+// Lets mission Lua read keys in-game (e.g. Ctrl + WASD) that stock Lua cannot see,
+// enabling Helldivers-style stratagem input codes. Returns true if the key is down now.
+static int lua_GameExt_KeyDown(lua_State* L)
+{
+   if (!g_lua.isnumber(L, 1)) { g_lua.pushboolean(L, 0); return 1; }
+   const int vk = g_lua.tointeger(L, 1);
+   int down = 0;
+   if (vk > 0 && vk <= 0xFE)
+      down = ((GetAsyncKeyState(vk) & 0x8000) != 0) ? 1 : 0;
+   g_lua.pushboolean(L, down);
+   return 1;
+}
+
 static const lua_func_entry custom_functions[] = {
+   { "GameExt_KeyDown",       lua_GameExt_KeyDown },
    { "ContentCensus",         lua_ContentCensus },
    { "GetMissionName",        lua_GetMissionName },
    { "HttpGet",               lua_HttpGet },
