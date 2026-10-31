@@ -1761,7 +1761,9 @@ static int lua_GameExt_SuppressMovement(lua_State* L)
 //     "bool"  (default) -- a notification; drives EventEnable / EventDisable.
 //     "float"           -- drives EventAlpha / EventValue. value is a number.
 //     "uint"            -- drives EventBitmap (a texture hash) and the like.
-//     "color"           -- drives EventColor. value is a packed 0xRRGGBBAA integer.
+//     "color"           -- drives EventColor. value is a HEX STRING "RRGGBBAA"
+//                          (NOT a number: this VM's lua_Number is a 32-bit float,
+//                          so a packed colour would lose precision / overflow).
 //                          type_Color (7) carries a POINTER to 4 colour bytes which
 //                          the handler stores and derefs each frame, so we keep a
 //                          persistent per-event buffer (hud_color_buffer) alive for
@@ -1883,10 +1885,23 @@ static int lua_GameExt_SetHudEvent(lua_State* L)
       type = kHudTypeUint;
       data = (uint32_t)(g_lua.isnumber(L, 2) ? g_lua.tointeger(L, 2) : 0);
    } else if (typeStr && (*typeStr == 'c' || *typeStr == 'C')) {
-      // value is a packed 0xRRGGBBAA colour; stash the 4 bytes in a persistent
-      // per-event buffer and carry its pointer as the event data (see note above).
+      // value is a colour as a HEX STRING "RRGGBBAA". It must NOT come through a
+      // Lua number: this VM's lua_Number is a 32-bit float (lua_hooks.hpp), so a
+      // packed colour >= 2^24 loses precision and >= 2^31 casts to 0x80000000.
+      // Parse the 4 bytes here, stash them in a persistent per-event buffer and
+      // carry its pointer as the event data (see note above).
       type = kHudTypeColor;
-      const uint32_t packed = (uint32_t)(g_lua.isnumber(L, 2) ? g_lua.tointeger(L, 2) : 0);
+      const char* hex = g_lua.tolstring(L, 2, nullptr);
+      uint32_t packed = 0;
+      for (const char* p = hex; p && *p; ++p) {
+         uint32_t d;
+         const char c = *p;
+         if      (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+         else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+         else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+         else continue;
+         packed = (packed << 4) | d;
+      }
       uint8_t* buf = hud_color_buffer(pbl_hash(name));
       buf[0] = (uint8_t)((packed >> 24) & 0xFF);   // R
       buf[1] = (uint8_t)((packed >> 16) & 0xFF);   // G
