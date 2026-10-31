@@ -8,6 +8,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <string.h>
 
 // ---------------------------------------------------------------------------
 // Real dinput8.dll forwarding
@@ -21,12 +22,71 @@ using PFN_DirectInput8Create = HRESULT(WINAPI*)(
 
 static PFN_DirectInput8Create g_realDI8Create = nullptr;
 
+// ---------------------------------------------------------------------------
+// Movement-key masking (stratagem input mode)
+// ---------------------------------------------------------------------------
+// While BF2GameExt's Lua enables suppression (GameExt_SuppressMovement), we zero
+// the movement scancodes in the DirectInput keyboard state before the game reads
+// them, so the character stops moving. GameExt_KeyDown reads the physical keys via
+// GetAsyncKeyState (a separate path), so the stratagem code input still works.
+
+typedef int (WINAPI* PFN_GetMoveSuppress)();
+static PFN_GetMoveSuppress g_getMoveSuppress = nullptr;
+
+// GUID_SysKeyboard (defined locally to avoid a dinput link dependency)
+static const GUID kGuidSysKeyboard =
+   { 0x6F1D2B61, 0xD5A0, 0x11CF, { 0xBF,0xC7,0x44,0x45,0x53,0x54,0x00,0x00 } };
+
+// DIK movement scancodes to mask: W, A, S, D, SPACE
+static const unsigned char kMoveDIK[] = { 0x11, 0x1E, 0x1F, 0x20, 0x39 };
+
+typedef HRESULT (STDMETHODCALLTYPE* PFN_GetDeviceState)(void* self, DWORD cb, void* data);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateDevice)(void* self, const GUID& rguid, void** dev, void* outer);
+
+static PFN_GetDeviceState g_realGetDeviceState = nullptr;
+static PFN_CreateDevice   g_realCreateDevice   = nullptr;
+
+static void PatchVtable(void* iface, int index, void* hook, void** saveOrig)
+{
+   if (!iface || *saveOrig) return;            // nothing, or already patched
+   void** vtbl = *(void***)iface;
+   DWORD oldProt;
+   if (VirtualProtect(&vtbl[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt)) {
+      *saveOrig = vtbl[index];
+      vtbl[index] = hook;
+      VirtualProtect(&vtbl[index], sizeof(void*), oldProt, &oldProt);
+   }
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_GetDeviceState(void* self, DWORD cb, void* data)
+{
+   HRESULT hr = g_realGetDeviceState(self, cb, data);
+   // cb == 256 identifies the keyboard state buffer (rgbKeys[256]); avoid touching mouse/joystick
+   if (hr >= 0 && data && cb == 256 && g_getMoveSuppress && g_getMoveSuppress()) {
+      unsigned char* keys = (unsigned char*)data;
+      for (int i = 0; i < (int)(sizeof(kMoveDIK) / sizeof(kMoveDIK[0])); ++i)
+         keys[kMoveDIK[i]] = 0;
+   }
+   return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(void* self, const GUID& rguid, void** dev, void* outer)
+{
+   HRESULT hr = g_realCreateDevice(self, rguid, dev, outer);
+   if (hr >= 0 && dev && *dev && memcmp(&rguid, &kGuidSysKeyboard, sizeof(GUID)) == 0)
+      PatchVtable(*dev, 9, (void*)&Hook_GetDeviceState, (void**)&g_realGetDeviceState);  // slot 9 = GetDeviceState
+   return hr;
+}
+
 extern "C" __declspec(dllexport) HRESULT WINAPI DirectInput8Create(
    HINSTANCE hinst, DWORD dwVersion, REFIID riidltf,
    void** ppvOut, void* punkOuter)
 {
    if (!g_realDI8Create) return E_FAIL;
-   return g_realDI8Create(hinst, dwVersion, riidltf, ppvOut, punkOuter);
+   HRESULT hr = g_realDI8Create(hinst, dwVersion, riidltf, ppvOut, punkOuter);
+   if (hr >= 0 && ppvOut && *ppvOut)
+      PatchVtable(*ppvOut, 3, (void*)&Hook_CreateDevice, (void**)&g_realCreateDevice);   // slot 3 = CreateDevice
+   return hr;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +170,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
 
       auto initFn = (PFN_BF2GameExt_Init)GetProcAddress(g_bf2gameext, "BF2GameExt_Init");
       g_bf2gameext_shutdown = (PFN_BF2GameExt_Shutdown)GetProcAddress(g_bf2gameext, "BF2GameExt_Shutdown");
+      g_getMoveSuppress = (PFN_GetMoveSuppress)GetProcAddress(g_bf2gameext, "BF2GE_GetMoveSuppress");
 
       if (initFn) {
          uintptr_t exe_base = (uintptr_t)GetModuleHandleW(nullptr);

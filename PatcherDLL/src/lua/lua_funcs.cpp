@@ -1737,8 +1737,24 @@ static int lua_GameExt_KeyDown(lua_State* L)
    return 1;
 }
 
+// Movement suppression for "stratagem input" mode. Lua toggles it; the dinput8
+// proxy reads BF2GE_GetMoveSuppress() and masks movement keys from the game while on,
+// so the character stops moving while GameExt_KeyDown still reads the raw keys.
+static volatile int g_bf2ge_move_suppress = 0;
+extern "C" __declspec(dllexport) int WINAPI BF2GE_GetMoveSuppress() { return g_bf2ge_move_suppress; }
+
+static int lua_GameExt_SuppressMovement(lua_State* L)
+{
+   int on;
+   if (g_lua.isnumber(L, 1)) on = (g_lua.tonumber(L, 1) != 0) ? 1 : 0;
+   else                      on = g_lua.toboolean(L, 1) ? 1 : 0;
+   g_bf2ge_move_suppress = on;
+   return 0;
+}
+
 static const lua_func_entry custom_functions[] = {
-   { "GameExt_KeyDown",       lua_GameExt_KeyDown },
+   { "GameExt_KeyDown",         lua_GameExt_KeyDown },
+   { "GameExt_SuppressMovement", lua_GameExt_SuppressMovement },
    { "ContentCensus",         lua_ContentCensus },
    { "GetMissionName",        lua_GetMissionName },
    { "HttpGet",               lua_HttpGet },
