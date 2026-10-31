@@ -1902,10 +1902,13 @@ static int lua_GameExt_SetHudEvent(lua_State* L)
          else continue;
          packed = (packed << 4) | d;
       }
+      // RedColor is laid out B,G,R,A in memory (proven in game: a red authored as
+      // RGBA bytes read back blue). Keep the intuitive RRGGBBAA input and store it
+      // in the engine's BGRA byte order here.
       uint8_t* buf = hud_color_buffer(pbl_hash(name));
-      buf[0] = (uint8_t)((packed >> 24) & 0xFF);   // R
+      buf[0] = (uint8_t)((packed >>  8) & 0xFF);   // B
       buf[1] = (uint8_t)((packed >> 16) & 0xFF);   // G
-      buf[2] = (uint8_t)((packed >>  8) & 0xFF);   // B
+      buf[2] = (uint8_t)((packed >> 24) & 0xFF);   // R
       buf[3] = (uint8_t)( packed        & 0xFF);   // A
       data = (uint32_t)(uintptr_t)buf;
    } else {
