@@ -1972,6 +1972,9 @@ bool os_place_prop_at(void* entity, const float pos[3], const float nearRef[3])
    const float tx = m[12], ty = m[13], tz = m[14];
    const float dx = tx - nearRef[0], dy = ty - nearRef[1], dz = tz - nearRef[2];
    const float d2 = dx*dx + dy*dy + dz*dz;
+   const auto fn_log = get_gamelog();
+   if (fn_log) fn_log("[os_place_prop_at] ent=%p cur_trans=(%.1f,%.1f,%.1f) nearRef=(%.1f,%.1f,%.1f) d2=%.1f target=(%.1f,%.1f,%.1f)\n",
+                      entity, tx,ty,tz, nearRef[0],nearRef[1],nearRef[2], d2, pos[0],pos[1],pos[2]);
    if (!(d2 < 10000.0f)) return false;   // NaN or >100u from spawn -> not the matrix, skip
    m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2];
    return true;
