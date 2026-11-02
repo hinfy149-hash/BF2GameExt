@@ -1957,28 +1957,24 @@ constexpr unsigned kOS_TgoInline   = 0x18;    // inline mCollisionSphere (Vec3 f
 constexpr unsigned kOS_CtrlToEnt   = 0x240;   // Entity* = Controllable* - 0x240
 constexpr unsigned kOS_DamageableOff = 0x140; // Damageable sub-object = Entity + 0x140
 constexpr unsigned kOS_KillSlot      = 1;     // Damageable vtable slot 1 = Kill() (carrier/walker kills)
-constexpr unsigned kOS_VtGetMatrix   = 0x40;  // CollisionObject vtable: GetMatrix (byte offset)
-constexpr unsigned kOS_VtSetMatrix   = 0x0C;  // CollisionObject vtable: SetMatrix (byte offset)
+constexpr unsigned kOS_PropMatrix = 0xE4;  // EntityProp mMatrix (CollisionObject+0xE4)
 
-using fn_GetMatrix = float*(__fastcall*)(void* ecx, void* edx);
-using fn_SetMatrix = void (__fastcall*)(void* ecx, void* edx, void* mtx);
-
-// Move a spawned CollisionObject (prop/building/vehicle) to a world position,
-// keeping its orientation. Translation is at matrix bytes +0x30/0x34/0x38
-// (float indices 12/13/14). Proven round-trip (see docs/RE/ProceduralAnimation).
-void os_move_entity_to(void* entity, const float pos[3])
+// Move an EntityProp to a world position by writing its mMatrix translation at
+// +0xE4 directly (indices 12/13/14). NO vtable call, so nothing can loop/hang.
+// Guarded: only writes when the current translation is finite and near `nearRef`
+// (the object's spawn point), which confirms +0xE4 really is this class's matrix
+// -- an EntityProp has its CollisionObject at offset 0, so +0xE4 holds the matrix;
+// a building/other object does not, and the guard then skips the write rather than
+// corrupting memory. Returns true if it moved. (Render only; collision unchanged.)
+bool os_place_prop_at(void* entity, const float pos[3], const float nearRef[3])
 {
-   void** vtbl = *(void***)entity;
-   if (!vtbl) return;
-   fn_GetMatrix getM = (fn_GetMatrix)vtbl[kOS_VtGetMatrix / 4];
-   fn_SetMatrix setM = (fn_SetMatrix)vtbl[kOS_VtSetMatrix / 4];
-   if (!getM || !setM) return;
-   float* m = getM(entity, nullptr);
-   if (!m) return;
-   float nm[16];
-   for (int i = 0; i < 16; i++) nm[i] = m[i];
-   nm[12] = pos[0]; nm[13] = pos[1]; nm[14] = pos[2];
-   setM(entity, nullptr, nm);
+   float* m = (float*)((char*)entity + kOS_PropMatrix);
+   const float tx = m[12], ty = m[13], tz = m[14];
+   const float dx = tx - nearRef[0], dy = ty - nearRef[1], dz = tz - nearRef[2];
+   const float d2 = dx*dx + dy*dy + dz*dz;
+   if (!(d2 < 10000.0f)) return false;   // NaN or >100u from spawn -> not the matrix, skip
+   m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2];
+   return true;
 }
 
 // Damageable::Kill — virtual slot 1, __thiscall(Damageable* this), no args. The
@@ -2268,10 +2264,13 @@ static int lua_GameExt_PlaceBeaconAtAim(lua_State* L)
       float land[3];
       os_ballistic_land(eye, vel, casterEnt, land);
 
-      if (beacon) os_move_entity_to(beacon, land);     // VISIBLE: beacon jumps to the landing
+      float casterPos[3];
+      os_entity_pos(casterEnt, casterPos);
+      bool moved = false;
+      if (beacon) moved = os_place_prop_at(beacon, land, casterPos);  // VISIBLE marker at the landing
       killed = os_strike_at(tor, land, radius, casterTeam, casterEnt);
-      if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] land=(%.1f,%.1f,%.1f) beacon=%p killed=%d\n",
-                                 land[0],land[1],land[2], beacon, killed);
+      if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] land=(%.1f,%.1f,%.1f) beacon=%p moved=%d killed=%d\n",
+                                 land[0],land[1],land[2], beacon, (int)moved, killed);
    } __except (EXCEPTION_EXECUTE_HANDLER) {
       if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] EXCEPTION\n");
       g_lua.pushnil(L); return 1;
