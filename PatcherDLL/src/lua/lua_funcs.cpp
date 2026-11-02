@@ -1966,6 +1966,32 @@ constexpr unsigned kOS_PropMatrix = 0xF0;  // Steam EntityProp mMatrix (modtools
 
 void os_entity_pos(uintptr_t entity, float out[3]);   // fwd decl (defined below)
 
+// The CollisionObject sub-object sits at entity+0xC for these objects (both the
+// player character and com_prop_buildzone): os_entity_pos reads the TreeGrid
+// stack ptr at entity+0x10 == coll+0x4, and the matrix is at entity+0xF0 ==
+// coll+0xE4. UpdateTreeGrid is a CollisionObject method, so it takes the coll.
+constexpr unsigned kOS_CollObjOff = 0xC;
+
+// CollisionObject::UpdateTreeGrid(this) -- __thiscall, no args. Re-inserts the
+// object into the collision tree from its matrix (coll+0xE4). This is the second
+// half of the engine's own teleport: PAAnimation::Update writes the matrix with
+// SetMatrix(vtbl+0xC) and then calls this, unconditionally. Writing the matrix
+// alone moves nothing visible; this makes the render/collision follow.
+using fn_UpdateTreeGrid = void(__thiscall*)(void* collisionObject);
+void os_update_tree_grid(void* entity)
+{
+   uintptr_t a = 0;
+   switch (g_build) {
+      case GameBuild::Steam: a = game_addrs::steam::update_tree_grid; break;
+      default: a = 0;   // modtools/GOG address not mapped yet -> skip (no teleport)
+   }
+   if (!a || !entity) return;
+   const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+   fn_UpdateTreeGrid fn = (fn_UpdateTreeGrid)((a - kUnrelocatedBase) + base);
+   void* coll = (void*)((char*)entity + kOS_CollObjOff);
+   __try { fn(coll); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 // Move an EntityProp to a world position by writing its mMatrix translation
 // directly (matrix @ +0xF0, translation at indices 12/13/14). NO vtable call, so
 // nothing can loop/hang. Self-validating guard: the write only happens when the
@@ -1999,6 +2025,15 @@ bool os_place_prop_at(void* entity, const float pos[3], const float nearRef[3])
 
    __try { m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2]; }
    __except (EXCEPTION_EXECUTE_HANDLER) { if (fn_log) fn_log("[os_place_prop_at] write +0xF0 FAULT\n"); return false; }
+
+   // Teleport for real: re-insert into the collision tree from the new matrix, so
+   // the render/collision follow (the matrix write alone moves nothing visible).
+   os_update_tree_grid(entity);
+   if (fn_log) {
+      float after[3] = {0,0,0};
+      __try { os_entity_pos((uintptr_t)entity, after); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+      fn_log("[os_place_prop_at] after UpdateTreeGrid: os_entity_pos=(%.1f,%.1f,%.1f)\n", after[0],after[1],after[2]);
+   }
    return true;
 }
 

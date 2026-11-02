@@ -2268,6 +2268,7 @@ namespace steam {
    constexpr uintptr_t set_target_locked_obj          = 0x004844A0;
    constexpr uintptr_t m_camera_global                = 0x007f58e0;
    constexpr uintptr_t team_get_objects_in_range      = 0x006552d0; // LTCG convention: ECX=pos, EDX=out, XMM1=radius, stack=(max,team,flags,exclude) — NOT cdecl; use the aim_assist release thunk
+   constexpr uintptr_t update_tree_grid               = 0x006288e0; // CollisionObject::UpdateTreeGrid(this) __thiscall, no args; re-inserts from matrix (coll+0xE4). Found as the direct call right after SetMatrix(vtbl+0xC) in PAAnimation::Update (caller of CalculateNextMatrix 0x627370).
 
    constexpr uintptr_t anim_finder_add_bank     = 0x00645a00;
    // EntityCarrierClass::SetProperty — Ghidra-named; EntityCarrierClass vtable
