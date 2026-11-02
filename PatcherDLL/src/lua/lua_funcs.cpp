@@ -1953,6 +1953,13 @@ constexpr unsigned kOS_TgoStackPtr = 0x10;    // TreeGridObject.mStackPtr
 constexpr unsigned kOS_TgoStackIdx = 0x14;    // TreeGridObject.mStackIdx
 constexpr unsigned kOS_TgoInline   = 0x18;    // inline mCollisionSphere (Vec3 fallback)
 constexpr unsigned kOS_CtrlToEnt   = 0x240;   // Entity* = Controllable* - 0x240
+constexpr unsigned kOS_DamageableOff = 0x140; // Damageable sub-object = Entity + 0x140
+constexpr unsigned kOS_KillSlot      = 1;     // Damageable vtable slot 1 = Kill() (carrier/walker kills)
+
+// Damageable::Kill — virtual slot 1, __thiscall(Damageable* this), no args. The
+// engine's own death path (EntityCarrier::Kill / CommandWalker::Kill are this
+// slot); it triggers a real death, unlike a passive write to mCurHealth.
+using fn_DamageableKill = void(__thiscall*)(void* damageable);
 
 using fn_TeamGetObjInRange = int(__cdecl*)(float* pos, float radius, uintptr_t* out,
                                            int maxCount, void* team, int flags, uintptr_t exclude);
@@ -2048,9 +2055,18 @@ static int lua_GameExt_OrbitalStrike(lua_State* L)
          if (!e) continue;
          uint32_t t = (*(uint32_t*)(e + kOS_TeamAndType)) & 0xF;
          if (t == 0 || t == casterTeam) continue;           // neutral or friendly
-         float* hp = (float*)(e + kOS_Health);
-         float h = *hp;
-         if (h > 0.0f && h < 1.0e6f) { *hp = 0.0f; killed++; }  // lethal
+         // Guard: only act on things that look like a live damageable unit.
+         float h = *(float*)(e + kOS_Health);
+         if (!(h > 0.0f && h < 1.0e6f)) continue;
+         // Call Damageable::Kill (vtable slot 1) on the Damageable sub-object —
+         // the engine's real death path (a passive mCurHealth write does nothing).
+         void*  dmg  = (void*)(e + kOS_DamageableOff);
+         void** vtbl = *(void***)dmg;
+         if (!vtbl) continue;
+         fn_DamageableKill killFn = (fn_DamageableKill)vtbl[kOS_KillSlot];
+         if (!killFn) continue;
+         killFn(dmg);
+         killed++;
       }
    } __except (EXCEPTION_EXECUTE_HANDLER) {
       g_lua.pushnil(L); return 1;
