@@ -1957,37 +1957,48 @@ constexpr unsigned kOS_TgoInline   = 0x18;    // inline mCollisionSphere (Vec3 f
 constexpr unsigned kOS_CtrlToEnt   = 0x240;   // Entity* = Controllable* - 0x240
 constexpr unsigned kOS_DamageableOff = 0x140; // Damageable sub-object = Entity + 0x140
 constexpr unsigned kOS_KillSlot      = 1;     // Damageable vtable slot 1 = Kill() (carrier/walker kills)
-constexpr unsigned kOS_PropMatrix = 0xE4;  // EntityProp mMatrix (CollisionObject+0xE4)
+// EntityProp world matrix. The modtools RE has it at CollisionObject+0xE4, but on
+// the Steam build the struct is shifted +0xC: dumping +0xE4 put the world X at
+// float index 15, i.e. the matrix really starts at +0xF0 and its translation
+// (indices 12/13/14) lands at entity+0x120/0x124/0x128. Confirmed in game: the
+// freshly-spawned beacon's +0xF0 translation matched os_entity_pos(beacon).
+constexpr unsigned kOS_PropMatrix = 0xF0;  // Steam EntityProp mMatrix (modtools RE: +0xE4)
 
 void os_entity_pos(uintptr_t entity, float out[3]);   // fwd decl (defined below)
 
-// Move an EntityProp to a world position by writing its mMatrix translation at
-// +0xE4 directly (indices 12/13/14). NO vtable call, so nothing can loop/hang.
-// Guarded: only writes when the current translation is finite and near `nearRef`
-// (the object's spawn point), which confirms +0xE4 really is this class's matrix
-// -- an EntityProp has its CollisionObject at offset 0, so +0xE4 holds the matrix;
-// a building/other object does not, and the guard then skips the write rather than
-// corrupting memory. Returns true if it moved. (Render only; collision unchanged.)
+// Move an EntityProp to a world position by writing its mMatrix translation
+// directly (matrix @ +0xF0, translation at indices 12/13/14). NO vtable call, so
+// nothing can loop/hang. Self-validating guard: the write only happens when the
+// current +0xF0 translation matches os_entity_pos(entity) -- the TreeGrid world
+// position, a proven-correct source -- within a few units. That proves +0xF0 is
+// really this object's matrix before we write; if it is not (another class, a bad
+// pointer), the values disagree and we skip rather than corrupt memory.
+// Returns true if it moved. (Render only; collision/TreeGrid unchanged.)
 bool os_place_prop_at(void* entity, const float pos[3], const float nearRef[3])
 {
+   (void)nearRef;
    float* m = (float*)((char*)entity + kOS_PropMatrix);
-   const float tx = m[12], ty = m[13], tz = m[14];
-   const float dx = tx - nearRef[0], dy = ty - nearRef[1], dz = tz - nearRef[2];
-   const float d2 = dx*dx + dy*dy + dz*dz;
    const auto fn_log = get_gamelog();
-   if (fn_log) {
-      fn_log("[os_place_prop_at] ent=%p cur_trans=(%.1f,%.1f,%.1f) nearRef=(%.1f,%.1f,%.1f) d2=%.1f target=(%.1f,%.1f,%.1f)\n",
-             entity, tx,ty,tz, nearRef[0],nearRef[1],nearRef[2], d2, pos[0],pos[1],pos[2]);
-      // DIAG: full +0xE4 matrix (16 floats) -- find which indices hold the world translation (~nearRef).
-      fn_log("[os_place_prop_at] mtx@0xE4 row0=(%.2f,%.2f,%.2f,%.2f) row1=(%.2f,%.2f,%.2f,%.2f) row2=(%.2f,%.2f,%.2f,%.2f) row3=(%.2f,%.2f,%.2f,%.2f)\n",
-             m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
-      // DIAG: does the beacon's TreeGrid position (os_entity_pos) read the real world pos?
-      float tp[3] = {0,0,0};
-      __try { os_entity_pos((uintptr_t)entity, tp); } __except (EXCEPTION_EXECUTE_HANDLER) { tp[0]=tp[1]=tp[2]=-99999.0f; }
-      fn_log("[os_place_prop_at] os_entity_pos(beacon)=(%.1f,%.1f,%.1f)\n", tp[0],tp[1],tp[2]);
-   }
-   if (!(d2 < 10000.0f)) return false;   // NaN or >100u from spawn -> not the matrix, skip
-   m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2];
+
+   float truth[3] = {0,0,0};
+   bool gotTruth = false;
+   __try { os_entity_pos((uintptr_t)entity, truth); gotTruth = true; }
+   __except (EXCEPTION_EXECUTE_HANDLER) { gotTruth = false; }
+
+   float tx, ty, tz;
+   __try { tx = m[12]; ty = m[13]; tz = m[14]; }
+   __except (EXCEPTION_EXECUTE_HANDLER) { if (fn_log) fn_log("[os_place_prop_at] read +0xF0 FAULT\n"); return false; }
+
+   const float dx = tx - truth[0], dy = ty - truth[1], dz = tz - truth[2];
+   const float d2 = dx*dx + dy*dy + dz*dz;
+   if (fn_log) fn_log("[os_place_prop_at] ent=%p trans@0xF0=(%.1f,%.1f,%.1f) truth=(%.1f,%.1f,%.1f) d2=%.2f target=(%.1f,%.1f,%.1f)\n",
+                      entity, tx,ty,tz, truth[0],truth[1],truth[2], d2, pos[0],pos[1],pos[2]);
+
+   // +0xF0 must agree with the TreeGrid world pos (<= ~5u) to confirm it is the matrix.
+   if (!gotTruth || !(d2 < 25.0f)) { if (fn_log) fn_log("[os_place_prop_at] SKIP: +0xF0 trans != world pos (not the matrix)\n"); return false; }
+
+   __try { m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2]; }
+   __except (EXCEPTION_EXECUTE_HANDLER) { if (fn_log) fn_log("[os_place_prop_at] write +0xF0 FAULT\n"); return false; }
    return true;
 }
 
