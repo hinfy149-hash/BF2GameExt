@@ -2137,10 +2137,13 @@ static int lua_GameExt_OrbitalStrikeAimed(lua_State* L)
    const int   charIndex = g_lua.tointeger(L, 1);
    const float speed     = (float)g_lua.tonumber(L, 2);
    const float radius    = (float)g_lua.tonumber(L, 3);
-   if (speed <= 0.0f || radius <= 0.0f) { g_lua.pushnil(L); return 1; }
+   const auto  fn_GameLog = get_gamelog();
+   if (fn_GameLog) fn_GameLog("[OrbitalStrikeAimed] called: char=%d speed=%.1f radius=%.1f\n",
+                              charIndex, speed, radius);
+   if (speed <= 0.0f || radius <= 0.0f) { if (fn_GameLog) fn_GameLog("[OrbitalStrikeAimed] bad speed/radius\n"); g_lua.pushnil(L); return 1; }
 
    fn_TeamGetObjInRange tor = os_resolve_tor();
-   if (!tor) { g_lua.pushnil(L); return 1; }
+   if (!tor) { if (fn_GameLog) fn_GameLog("[OrbitalStrikeAimed] tor resolve FAILED (build=%d)\n", (int)g_build); g_lua.pushnil(L); return 1; }
 
    const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
    auto res = [=](uintptr_t a) -> uintptr_t { return a - kUnrelocatedBase + base; };
@@ -2175,7 +2178,16 @@ static int lua_GameExt_OrbitalStrikeAimed(lua_State* L)
       os_ballistic_land(eye, vel, casterEnt, land);
 
       killed = os_strike_at(tor, land, radius, casterTeam, casterEnt);
+      if (fn_GameLog) {
+         float dx = land[0]-eye[0], dz = land[2]-eye[2];
+         float horiz = sqrtf(dx*dx + dz*dz);
+         fn_GameLog("[OrbitalStrikeAimed] team=%u eye=(%.1f,%.1f,%.1f) dir=(%.2f,%.2f,%.2f) "
+                    "land=(%.1f,%.1f,%.1f) throwDist=%.1f killed=%d\n",
+                    casterTeam, eye[0],eye[1],eye[2], dir[0],dir[1],dir[2],
+                    land[0],land[1],land[2], horiz, killed);
+      }
    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      if (fn_GameLog) fn_GameLog("[OrbitalStrikeAimed] EXCEPTION caught\n");
       g_lua.pushnil(L); return 1;
    }
 
