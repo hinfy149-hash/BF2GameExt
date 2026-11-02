@@ -1930,10 +1930,141 @@ static int lua_GameExt_SetHudEvent(lua_State* L)
    return 1;
 }
 
+// ===========================================================================
+// GameExt_OrbitalStrike(charIndex, radius) -- offensive stratagem. Kills every
+// enemy unit within `radius` of the caster character (the one at charIndex).
+// Returns the number killed, or nil on failure.
+//
+// Reuses the engine's own spatial query TeamManager::GetObjectsInRange and the
+// entity offsets the aim-assist code already proved (controller/aim_assist.cpp):
+//   entity = *(charSlot+0x148) - 0x240   (Controllable -> Entity base)
+//   team   = *(entity+0x234) & 0xF       (0 = neutral)
+//   health = *(float*)(entity+0x144)     (Damageable.mCurHealth)
+//   pos    = collision-sphere position (TreeGridObject at entity+0x10/0x14/0x18)
+// Lethal = write 0 to mCurHealth; the engine's Damageable update turns <=0 into
+// a normal death next frame. A sanity band on the health float keeps us from
+// writing into a non-damageable object the query may also return.
+// ===========================================================================
+namespace {
+
+constexpr unsigned kOS_TeamAndType = 0x234;   // GameObject team (low nibble) + type bits
+constexpr unsigned kOS_Health      = 0x144;   // Damageable.mCurHealth (float)
+constexpr unsigned kOS_TgoStackPtr = 0x10;    // TreeGridObject.mStackPtr
+constexpr unsigned kOS_TgoStackIdx = 0x14;    // TreeGridObject.mStackIdx
+constexpr unsigned kOS_TgoInline   = 0x18;    // inline mCollisionSphere (Vec3 fallback)
+constexpr unsigned kOS_CtrlToEnt   = 0x240;   // Entity* = Controllable* - 0x240
+
+using fn_TeamGetObjInRange = int(__cdecl*)(float* pos, float radius, uintptr_t* out,
+                                           int maxCount, void* team, int flags, uintptr_t exclude);
+
+// Steam/GOG build this with an LTCG convention (ECX=pos, EDX=out, XMM1=radius,
+// stack=max,team,flags,exclude) -- not cdecl. Same marshalling thunk the aim
+// assist uses (controller/aim_assist.cpp teamGetObjectsInRange_release_thunk).
+void* s_os_torRelease = nullptr;
+int __cdecl os_tor_release_thunk(float* pos, float radius, uintptr_t* out,
+                                 int maxCount, void* team, int flags, uintptr_t exclude)
+{
+   int result;
+   __asm {
+      movss  xmm1, radius
+      push   exclude
+      push   flags
+      push   team
+      push   maxCount
+      mov    edx, out
+      mov    ecx, pos
+      call   s_os_torRelease
+      add    esp, 16
+      mov    result, eax
+   }
+   return result;
+}
+
+fn_TeamGetObjInRange os_resolve_tor()
+{
+   const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+   uintptr_t addr = 0; bool release = false;
+   switch (g_build) {
+      case GameBuild::Modtools: addr = game_addrs::modtools::team_get_objects_in_range; break;
+      case GameBuild::Steam:    addr = game_addrs::steam::team_get_objects_in_range;    release = true; break;
+      case GameBuild::GOG:      addr = game_addrs::gog::team_get_objects_in_range;      release = true; break;
+      default: return nullptr;
+   }
+   void* fn = (void*)((addr - kUnrelocatedBase) + base);
+   if (release) { s_os_torRelease = fn; return os_tor_release_thunk; }
+   return (fn_TeamGetObjInRange)fn;
+}
+
+void os_entity_pos(uintptr_t entity, float out[3])
+{
+   uintptr_t stackPtr = *(uintptr_t*)(entity + kOS_TgoStackPtr);
+   if (stackPtr) {
+      int idx = *(int*)(entity + kOS_TgoStackIdx);
+      float* p = (float*)(stackPtr + (idx + 4) * 16);
+      out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+   } else {
+      float* p = (float*)(entity + kOS_TgoInline);
+      out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+   }
+}
+
+} // namespace
+
+static int lua_GameExt_OrbitalStrike(lua_State* L)
+{
+   if (!g_addr->char_array_base || !g_addr->max_chars) { g_lua.pushnil(L); return 1; }
+   if (!g_lua.isnumber(L, 1) || !g_lua.isnumber(L, 2)) { g_lua.pushnil(L); return 1; }
+
+   const int   charIndex = g_lua.tointeger(L, 1);
+   const float radius    = (float)g_lua.tonumber(L, 2);
+   if (radius <= 0.0f) { g_lua.pushnil(L); return 1; }
+
+   fn_TeamGetObjInRange tor = os_resolve_tor();
+   if (!tor) { g_lua.pushnil(L); return 1; }
+
+   const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+   auto res = [=](uintptr_t a) -> uintptr_t { return a - kUnrelocatedBase + base; };
+   const int maxChars = *(int*)res(g_addr->max_chars);
+   if (charIndex < 0 || charIndex >= maxChars) { g_lua.pushnil(L); return 1; }
+   const uintptr_t arrayBase = *(uintptr_t*)res(g_addr->char_array_base);
+   if (!arrayBase) { g_lua.pushnil(L); return 1; }
+
+   int killed = 0;
+   __try {
+      char* slot = (char*)arrayBase + charIndex * layout::Character::kSize;
+      uintptr_t ctrl = *(uintptr_t*)(slot + layout::Character::kUnit);
+      if (!ctrl) { g_lua.pushnil(L); return 1; }
+      uintptr_t casterEnt  = ctrl - kOS_CtrlToEnt;
+      uint32_t  casterTeam = (*(uint32_t*)(casterEnt + kOS_TeamAndType)) & 0xF;
+
+      float pos[3];
+      os_entity_pos(casterEnt, pos);
+
+      static uintptr_t nearby[128];
+      int n = tor(pos, radius, nearby, 128, nullptr, 0x02, casterEnt);
+      if (n > 128) n = 128;
+      for (int i = 0; i < n; i++) {
+         uintptr_t e = nearby[i];
+         if (!e) continue;
+         uint32_t t = (*(uint32_t*)(e + kOS_TeamAndType)) & 0xF;
+         if (t == 0 || t == casterTeam) continue;           // neutral or friendly
+         float* hp = (float*)(e + kOS_Health);
+         float h = *hp;
+         if (h > 0.0f && h < 1.0e6f) { *hp = 0.0f; killed++; }  // lethal
+      }
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+      g_lua.pushnil(L); return 1;
+   }
+
+   g_lua.pushnumber(L, (float)killed);
+   return 1;
+}
+
 static const lua_func_entry custom_functions[] = {
    { "GameExt_KeyDown",         lua_GameExt_KeyDown },
    { "GameExt_SuppressMovement", lua_GameExt_SuppressMovement },
    { "GameExt_SetHudEvent",     lua_GameExt_SetHudEvent },
+   { "GameExt_OrbitalStrike",   lua_GameExt_OrbitalStrike },
    { "ContentCensus",         lua_ContentCensus },
    { "GetMissionName",        lua_GetMissionName },
    { "HttpGet",               lua_HttpGet },
