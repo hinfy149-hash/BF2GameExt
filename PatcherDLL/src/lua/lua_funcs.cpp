@@ -2306,7 +2306,12 @@ static int lua_GameExt_PlaceBeaconAtAim(lua_State* L)
       float casterPos[3];
       os_entity_pos(casterEnt, casterPos);
       bool moved = false;
-      if (beacon) moved = os_place_prop_at(beacon, land, casterPos);  // VISIBLE marker at the landing
+      // Lift the visible marker a few units off the ground so it is easy to spot
+      // at the landing (the pad sits flush with / sunk into terrain at y~0). The
+      // STRIKE still uses the true ground landing, not the lifted marker.
+      const float kBeaconLift = 4.0f;
+      float beaconPos[3] = { land[0], land[1] + kBeaconLift, land[2] };
+      if (beacon) moved = os_place_prop_at(beacon, beaconPos, casterPos);  // VISIBLE marker at the landing
       killed = os_strike_at(tor, land, radius, casterTeam, casterEnt);
       if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] eye=(%.1f,%.1f,%.1f) dir=(%.2f,%.2f,%.2f) "
                                  "vel=(%.1f,%.1f,%.1f) land=(%.1f,%.1f,%.1f) beacon=%p moved=%d killed=%d\n",
