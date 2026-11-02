@@ -1959,6 +1959,8 @@ constexpr unsigned kOS_DamageableOff = 0x140; // Damageable sub-object = Entity 
 constexpr unsigned kOS_KillSlot      = 1;     // Damageable vtable slot 1 = Kill() (carrier/walker kills)
 constexpr unsigned kOS_PropMatrix = 0xE4;  // EntityProp mMatrix (CollisionObject+0xE4)
 
+void os_entity_pos(uintptr_t entity, float out[3]);   // fwd decl (defined below)
+
 // Move an EntityProp to a world position by writing its mMatrix translation at
 // +0xE4 directly (indices 12/13/14). NO vtable call, so nothing can loop/hang.
 // Guarded: only writes when the current translation is finite and near `nearRef`
@@ -1973,8 +1975,17 @@ bool os_place_prop_at(void* entity, const float pos[3], const float nearRef[3])
    const float dx = tx - nearRef[0], dy = ty - nearRef[1], dz = tz - nearRef[2];
    const float d2 = dx*dx + dy*dy + dz*dz;
    const auto fn_log = get_gamelog();
-   if (fn_log) fn_log("[os_place_prop_at] ent=%p cur_trans=(%.1f,%.1f,%.1f) nearRef=(%.1f,%.1f,%.1f) d2=%.1f target=(%.1f,%.1f,%.1f)\n",
-                      entity, tx,ty,tz, nearRef[0],nearRef[1],nearRef[2], d2, pos[0],pos[1],pos[2]);
+   if (fn_log) {
+      fn_log("[os_place_prop_at] ent=%p cur_trans=(%.1f,%.1f,%.1f) nearRef=(%.1f,%.1f,%.1f) d2=%.1f target=(%.1f,%.1f,%.1f)\n",
+             entity, tx,ty,tz, nearRef[0],nearRef[1],nearRef[2], d2, pos[0],pos[1],pos[2]);
+      // DIAG: full +0xE4 matrix (16 floats) -- find which indices hold the world translation (~nearRef).
+      fn_log("[os_place_prop_at] mtx@0xE4 row0=(%.2f,%.2f,%.2f,%.2f) row1=(%.2f,%.2f,%.2f,%.2f) row2=(%.2f,%.2f,%.2f,%.2f) row3=(%.2f,%.2f,%.2f,%.2f)\n",
+             m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+      // DIAG: does the beacon's TreeGrid position (os_entity_pos) read the real world pos?
+      float tp[3] = {0,0,0};
+      __try { os_entity_pos((uintptr_t)entity, tp); } __except (EXCEPTION_EXECUTE_HANDLER) { tp[0]=tp[1]=tp[2]=-99999.0f; }
+      fn_log("[os_place_prop_at] os_entity_pos(beacon)=(%.1f,%.1f,%.1f)\n", tp[0],tp[1],tp[2]);
+   }
    if (!(d2 < 10000.0f)) return false;   // NaN or >100u from spawn -> not the matrix, skip
    m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2];
    return true;
