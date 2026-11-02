@@ -1957,6 +1957,29 @@ constexpr unsigned kOS_TgoInline   = 0x18;    // inline mCollisionSphere (Vec3 f
 constexpr unsigned kOS_CtrlToEnt   = 0x240;   // Entity* = Controllable* - 0x240
 constexpr unsigned kOS_DamageableOff = 0x140; // Damageable sub-object = Entity + 0x140
 constexpr unsigned kOS_KillSlot      = 1;     // Damageable vtable slot 1 = Kill() (carrier/walker kills)
+constexpr unsigned kOS_VtGetMatrix   = 0x40;  // CollisionObject vtable: GetMatrix (byte offset)
+constexpr unsigned kOS_VtSetMatrix   = 0x0C;  // CollisionObject vtable: SetMatrix (byte offset)
+
+using fn_GetMatrix = float*(__fastcall*)(void* ecx, void* edx);
+using fn_SetMatrix = void (__fastcall*)(void* ecx, void* edx, void* mtx);
+
+// Move a spawned CollisionObject (prop/building/vehicle) to a world position,
+// keeping its orientation. Translation is at matrix bytes +0x30/0x34/0x38
+// (float indices 12/13/14). Proven round-trip (see docs/RE/ProceduralAnimation).
+void os_move_entity_to(void* entity, const float pos[3])
+{
+   void** vtbl = *(void***)entity;
+   if (!vtbl) return;
+   fn_GetMatrix getM = (fn_GetMatrix)vtbl[kOS_VtGetMatrix / 4];
+   fn_SetMatrix setM = (fn_SetMatrix)vtbl[kOS_VtSetMatrix / 4];
+   if (!getM || !setM) return;
+   float* m = getM(entity, nullptr);
+   if (!m) return;
+   float nm[16];
+   for (int i = 0; i < 16; i++) nm[i] = m[i];
+   nm[12] = pos[0]; nm[13] = pos[1]; nm[14] = pos[2];
+   setM(entity, nullptr, nm);
+}
 
 // Damageable::Kill — virtual slot 1, __thiscall(Damageable* this), no args. The
 // engine's own death path (EntityCarrier::Kill / CommandWalker::Kill are this
@@ -2195,12 +2218,76 @@ static int lua_GameExt_OrbitalStrikeAimed(lua_State* L)
    return 1;
 }
 
+// ===========================================================================
+// GameExt_PlaceBeaconAtAim(beaconEntity, charIndex, throwSpeed, radius)
+//   beaconEntity: the userdata returned by Lua CreateEntity(...) for a visible
+//   marker object. The DLL computes the ballistic landing from the caster's aim,
+//   MOVES the beacon there (so you SEE where it lands), then strikes there.
+// Returns killed count (nil on failure). The visible-beacon version of the
+// thrown stratagem.
+// ===========================================================================
+static int lua_GameExt_PlaceBeaconAtAim(lua_State* L)
+{
+   if (!g_lua.touserdata) { g_lua.pushnil(L); return 1; }
+   if (!g_addr->char_array_base || !g_addr->max_chars) { g_lua.pushnil(L); return 1; }
+   if (!g_lua.isnumber(L, 2) || !g_lua.isnumber(L, 3) || !g_lua.isnumber(L, 4)) { g_lua.pushnil(L); return 1; }
+
+   void* beacon        = g_lua.touserdata(L, 1);
+   const int   charIndex = g_lua.tointeger(L, 2);
+   const float speed     = (float)g_lua.tonumber(L, 3);
+   const float radius    = (float)g_lua.tonumber(L, 4);
+   const auto  fn_GameLog = get_gamelog();
+   if (speed <= 0.0f || radius <= 0.0f) { g_lua.pushnil(L); return 1; }
+
+   fn_TeamGetObjInRange tor = os_resolve_tor();
+   if (!tor) { g_lua.pushnil(L); return 1; }
+
+   const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+   auto res = [=](uintptr_t a) -> uintptr_t { return a - kUnrelocatedBase + base; };
+   const int maxChars = *(int*)res(g_addr->max_chars);
+   if (charIndex < 0 || charIndex >= maxChars) { g_lua.pushnil(L); return 1; }
+   const uintptr_t arrayBase = *(uintptr_t*)res(g_addr->char_array_base);
+   if (!arrayBase) { g_lua.pushnil(L); return 1; }
+
+   int killed = 0;
+   __try {
+      char* slot = (char*)arrayBase + charIndex * layout::Character::kSize;
+      uintptr_t ctrl = *(uintptr_t*)(slot + layout::Character::kUnit);
+      if (!ctrl) { g_lua.pushnil(L); return 1; }
+      uintptr_t casterEnt  = ctrl - kOS_CtrlToEnt;
+      uint32_t  casterTeam = (*(uint32_t*)(casterEnt + kOS_TeamAndType)) & 0xF;
+
+      float eye[3], dir[3];
+      eye[0]=*(float*)(ctrl+kOS_CtrlAimStart); eye[1]=*(float*)(ctrl+kOS_CtrlAimStart+4); eye[2]=*(float*)(ctrl+kOS_CtrlAimStart+8);
+      dir[0]=*(float*)(ctrl+kOS_CtrlAimDir);   dir[1]=*(float*)(ctrl+kOS_CtrlAimDir+4);   dir[2]=*(float*)(ctrl+kOS_CtrlAimDir+8);
+      float dl = sqrtf(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
+      if (dl < 1e-4f) { g_lua.pushnil(L); return 1; }
+      dir[0]/=dl; dir[1]/=dl; dir[2]/=dl;
+
+      float vel[3] = { dir[0]*speed, dir[1]*speed + 0.35f*speed, dir[2]*speed };
+      float land[3];
+      os_ballistic_land(eye, vel, casterEnt, land);
+
+      if (beacon) os_move_entity_to(beacon, land);     // VISIBLE: beacon jumps to the landing
+      killed = os_strike_at(tor, land, radius, casterTeam, casterEnt);
+      if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] land=(%.1f,%.1f,%.1f) beacon=%p killed=%d\n",
+                                 land[0],land[1],land[2], beacon, killed);
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+      if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] EXCEPTION\n");
+      g_lua.pushnil(L); return 1;
+   }
+
+   g_lua.pushnumber(L, (float)killed);
+   return 1;
+}
+
 static const lua_func_entry custom_functions[] = {
    { "GameExt_KeyDown",         lua_GameExt_KeyDown },
    { "GameExt_SuppressMovement", lua_GameExt_SuppressMovement },
    { "GameExt_SetHudEvent",     lua_GameExt_SetHudEvent },
    { "GameExt_OrbitalStrike",   lua_GameExt_OrbitalStrike },
    { "GameExt_OrbitalStrikeAimed", lua_GameExt_OrbitalStrikeAimed },
+   { "GameExt_PlaceBeaconAtAim", lua_GameExt_PlaceBeaconAtAim },
    { "ContentCensus",         lua_ContentCensus },
    { "GetMissionName",        lua_GetMissionName },
    { "HttpGet",               lua_HttpGet },
