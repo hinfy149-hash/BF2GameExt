@@ -2076,7 +2076,15 @@ void os_ballistic_land(const float start[3], const float vel0[3], uintptr_t excl
    const float GRAV = -16.0f;   // world units/s^2 (tunable)
    const float DT   = 0.025f;
    const int   STEPS = 240;     // up to ~6 s of flight
+   // Push the launch point ~2 units out along the throw so the first segment
+   // starts OUTSIDE the caster's own collision; with mask 0x9A the old start
+   // (right at the eye) hit the player's own body and "landed" at step 0.
+   float vn = sqrtf(vel0[0]*vel0[0] + vel0[1]*vel0[1] + vel0[2]*vel0[2]);
    float p[3]  = { start[0], start[1], start[2] };
+   if (vn > 1e-4f) {
+      const float kNudge = 2.0f;
+      p[0] += vel0[0]/vn*kNudge; p[1] += vel0[1]/vn*kNudge; p[2] += vel0[2]/vn*kNudge;
+   }
    float v[3]  = { vel0[0], vel0[1], vel0[2] };
    void* exclude[1] = { (void*)excludeEnt };
    land[0] = p[0]; land[1] = p[1]; land[2] = p[2];
@@ -2088,7 +2096,9 @@ void os_ballistic_land(const float start[3], const float vel0[3], uintptr_t excl
       if (len > 1e-4f) {
          float dir[3] = { seg[0]/len, seg[1]/len, seg[2]/len };
          void* outHit = nullptr;
-         float frac = engine_ray_hit(p, dir, len, &outHit, exclude, 1, 0x9A);
+         // 0x90 = Ordnance::Update's world sweep (terrain+statics, NO soldiers)
+         // so the arc lands on world geometry, never on a unit (incl. the caster).
+         float frac = engine_ray_hit(p, dir, len, &outHit, exclude, 1, 0x90);
          if (outHit && frac < 1.0f) {               // world impact on this segment
             land[0] = p[0] + dir[0]*frac*len;
             land[1] = p[1] + dir[1]*frac*len;
@@ -2269,7 +2279,9 @@ static int lua_GameExt_PlaceBeaconAtAim(lua_State* L)
       bool moved = false;
       if (beacon) moved = os_place_prop_at(beacon, land, casterPos);  // VISIBLE marker at the landing
       killed = os_strike_at(tor, land, radius, casterTeam, casterEnt);
-      if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] land=(%.1f,%.1f,%.1f) beacon=%p moved=%d killed=%d\n",
+      if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] eye=(%.1f,%.1f,%.1f) dir=(%.2f,%.2f,%.2f) "
+                                 "vel=(%.1f,%.1f,%.1f) land=(%.1f,%.1f,%.1f) beacon=%p moved=%d killed=%d\n",
+                                 eye[0],eye[1],eye[2], dir[0],dir[1],dir[2], vel[0],vel[1],vel[2],
                                  land[0],land[1],land[2], beacon, (int)moved, killed);
    } __except (EXCEPTION_EXECUTE_HANDLER) {
       if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] EXCEPTION\n");
