@@ -9,11 +9,13 @@
 #include "core/lvl_read.hpp"
 #include "entity/flyer_carrier_fixes.hpp"
 #include "entity/instance_props.hpp"
+#include "weapon/barrel_fire_origin.hpp"   // engine_ray_hit (world raycast, per-build safe)
 #include "core/pbl_hash.hpp"
 #include "game/Battlefront2/Source/Character.h"
 #include "game/Battlefront2/Source/Weapon.h"
 #include <detours.h>
 #include <wininet.h>
+#include <math.h>   // sqrtf (ballistic arc)
 #pragma comment(lib, "wininet.lib")
 
 // ReadTextFile(path) - reads any file on disk, returns its contents as a string.
@@ -2015,6 +2017,71 @@ void os_entity_pos(uintptr_t entity, float out[3])
    }
 }
 
+// Controllable aim fields (same offsets the aim assist reads).
+constexpr unsigned kOS_CtrlAimStart = 0xDC;   // PblVector3 eye position
+constexpr unsigned kOS_CtrlAimDir   = 0xE8;   // PblVector3 aim direction
+
+// Kill every enemy (team != 0, != excludeTeam) within `radius` of `pos`, using the
+// engine spatial query + Damageable::Kill. Returns how many were killed.
+int os_strike_at(fn_TeamGetObjInRange tor, const float pos[3], float radius,
+                 uint32_t excludeTeam, uintptr_t excludeEnt)
+{
+   static uintptr_t nearby[128];
+   float q[3] = { pos[0], pos[1], pos[2] };
+   int n = tor(q, radius, nearby, 128, nullptr, 0x02, excludeEnt);
+   if (n > 128) n = 128;
+   int killed = 0;
+   for (int i = 0; i < n; i++) {
+      uintptr_t e = nearby[i];
+      if (!e) continue;
+      uint32_t t = (*(uint32_t*)(e + kOS_TeamAndType)) & 0xF;
+      if (t == 0 || t == excludeTeam) continue;
+      float h = *(float*)(e + kOS_Health);
+      if (!(h > 0.0f && h < 1.0e6f)) continue;
+      void*  dmg  = (void*)(e + kOS_DamageableOff);
+      void** vtbl = *(void***)dmg;
+      if (!vtbl) continue;
+      fn_DamageableKill killFn = (fn_DamageableKill)vtbl[kOS_KillSlot];
+      if (!killFn) continue;
+      killFn(dmg);
+      killed++;
+   }
+   return killed;
+}
+
+// March a ballistic arc from `start` along `vel` under gravity, raycasting each
+// segment against the world; write the first impact (or the arc's end) to `land`.
+void os_ballistic_land(const float start[3], const float vel0[3], uintptr_t excludeEnt,
+                       float land[3])
+{
+   const float GRAV = -16.0f;   // world units/s^2 (tunable)
+   const float DT   = 0.025f;
+   const int   STEPS = 240;     // up to ~6 s of flight
+   float p[3]  = { start[0], start[1], start[2] };
+   float v[3]  = { vel0[0], vel0[1], vel0[2] };
+   void* exclude[1] = { (void*)excludeEnt };
+   land[0] = p[0]; land[1] = p[1]; land[2] = p[2];
+   for (int i = 0; i < STEPS; i++) {
+      float np[3] = { p[0] + v[0]*DT, p[1] + v[1]*DT, p[2] + v[2]*DT };
+      v[1] += GRAV * DT;
+      float seg[3] = { np[0]-p[0], np[1]-p[1], np[2]-p[2] };
+      float len = sqrtf(seg[0]*seg[0] + seg[1]*seg[1] + seg[2]*seg[2]);
+      if (len > 1e-4f) {
+         float dir[3] = { seg[0]/len, seg[1]/len, seg[2]/len };
+         void* outHit = nullptr;
+         float frac = engine_ray_hit(p, dir, len, &outHit, exclude, 1, 0x9A);
+         if (outHit && frac < 1.0f) {               // world impact on this segment
+            land[0] = p[0] + dir[0]*frac*len;
+            land[1] = p[1] + dir[1]*frac*len;
+            land[2] = p[2] + dir[2]*frac*len;
+            return;
+         }
+      }
+      p[0]=np[0]; p[1]=np[1]; p[2]=np[2];
+      land[0]=p[0]; land[1]=p[1]; land[2]=p[2];
+   }
+}
+
 } // namespace
 
 static int lua_GameExt_OrbitalStrike(lua_State* L)
@@ -2046,28 +2113,68 @@ static int lua_GameExt_OrbitalStrike(lua_State* L)
 
       float pos[3];
       os_entity_pos(casterEnt, pos);
+      killed = os_strike_at(tor, pos, radius, casterTeam, casterEnt);
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+      g_lua.pushnil(L); return 1;
+   }
 
-      static uintptr_t nearby[128];
-      int n = tor(pos, radius, nearby, 128, nullptr, 0x02, casterEnt);
-      if (n > 128) n = 128;
-      for (int i = 0; i < n; i++) {
-         uintptr_t e = nearby[i];
-         if (!e) continue;
-         uint32_t t = (*(uint32_t*)(e + kOS_TeamAndType)) & 0xF;
-         if (t == 0 || t == casterTeam) continue;           // neutral or friendly
-         // Guard: only act on things that look like a live damageable unit.
-         float h = *(float*)(e + kOS_Health);
-         if (!(h > 0.0f && h < 1.0e6f)) continue;
-         // Call Damageable::Kill (vtable slot 1) on the Damageable sub-object —
-         // the engine's real death path (a passive mCurHealth write does nothing).
-         void*  dmg  = (void*)(e + kOS_DamageableOff);
-         void** vtbl = *(void***)dmg;
-         if (!vtbl) continue;
-         fn_DamageableKill killFn = (fn_DamageableKill)vtbl[kOS_KillSlot];
-         if (!killFn) continue;
-         killFn(dmg);
-         killed++;
-      }
+   g_lua.pushnumber(L, (float)killed);
+   return 1;
+}
+
+// ===========================================================================
+// GameExt_OrbitalStrikeAimed(charIndex, throwSpeed, radius) -- the stratagem
+// "beacon": a ballistic arc is thrown from the caster's eye along the aim
+// direction, raycast against the world to find where it LANDS, and the strike
+// happens there (not at the caster's feet). Returns the number killed, or nil.
+// This is the feasibility proof for the thrown-beacon system.
+// ===========================================================================
+static int lua_GameExt_OrbitalStrikeAimed(lua_State* L)
+{
+   if (!g_addr->char_array_base || !g_addr->max_chars) { g_lua.pushnil(L); return 1; }
+   if (!g_lua.isnumber(L, 1) || !g_lua.isnumber(L, 2) || !g_lua.isnumber(L, 3)) { g_lua.pushnil(L); return 1; }
+
+   const int   charIndex = g_lua.tointeger(L, 1);
+   const float speed     = (float)g_lua.tonumber(L, 2);
+   const float radius    = (float)g_lua.tonumber(L, 3);
+   if (speed <= 0.0f || radius <= 0.0f) { g_lua.pushnil(L); return 1; }
+
+   fn_TeamGetObjInRange tor = os_resolve_tor();
+   if (!tor) { g_lua.pushnil(L); return 1; }
+
+   const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+   auto res = [=](uintptr_t a) -> uintptr_t { return a - kUnrelocatedBase + base; };
+   const int maxChars = *(int*)res(g_addr->max_chars);
+   if (charIndex < 0 || charIndex >= maxChars) { g_lua.pushnil(L); return 1; }
+   const uintptr_t arrayBase = *(uintptr_t*)res(g_addr->char_array_base);
+   if (!arrayBase) { g_lua.pushnil(L); return 1; }
+
+   int killed = 0;
+   __try {
+      char* slot = (char*)arrayBase + charIndex * layout::Character::kSize;
+      uintptr_t ctrl = *(uintptr_t*)(slot + layout::Character::kUnit);
+      if (!ctrl) { g_lua.pushnil(L); return 1; }
+      uintptr_t casterEnt  = ctrl - kOS_CtrlToEnt;
+      uint32_t  casterTeam = (*(uint32_t*)(casterEnt + kOS_TeamAndType)) & 0xF;
+
+      float eye[3], dir[3];
+      eye[0] = *(float*)(ctrl + kOS_CtrlAimStart);
+      eye[1] = *(float*)(ctrl + kOS_CtrlAimStart + 4);
+      eye[2] = *(float*)(ctrl + kOS_CtrlAimStart + 8);
+      dir[0] = *(float*)(ctrl + kOS_CtrlAimDir);
+      dir[1] = *(float*)(ctrl + kOS_CtrlAimDir + 4);
+      dir[2] = *(float*)(ctrl + kOS_CtrlAimDir + 8);
+      float dl = sqrtf(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+      if (dl < 1e-4f) { g_lua.pushnil(L); return 1; }
+      dir[0]/=dl; dir[1]/=dl; dir[2]/=dl;
+
+      // Launch velocity: aim direction * speed, plus a small upward lob so a
+      // level aim still arcs out instead of hugging the ground.
+      float vel[3] = { dir[0]*speed, dir[1]*speed + 0.35f*speed, dir[2]*speed };
+      float land[3];
+      os_ballistic_land(eye, vel, casterEnt, land);
+
+      killed = os_strike_at(tor, land, radius, casterTeam, casterEnt);
    } __except (EXCEPTION_EXECUTE_HANDLER) {
       g_lua.pushnil(L); return 1;
    }
@@ -2081,6 +2188,7 @@ static const lua_func_entry custom_functions[] = {
    { "GameExt_SuppressMovement", lua_GameExt_SuppressMovement },
    { "GameExt_SetHudEvent",     lua_GameExt_SetHudEvent },
    { "GameExt_OrbitalStrike",   lua_GameExt_OrbitalStrike },
+   { "GameExt_OrbitalStrikeAimed", lua_GameExt_OrbitalStrikeAimed },
    { "ContentCensus",         lua_ContentCensus },
    { "GetMissionName",        lua_GetMissionName },
    { "HttpGet",               lua_HttpGet },
