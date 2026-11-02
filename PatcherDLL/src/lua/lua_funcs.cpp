@@ -2234,32 +2234,34 @@ static int lua_GameExt_OrbitalStrikeAimed(lua_State* L)
 // ===========================================================================
 static int lua_GameExt_PlaceBeaconAtAim(lua_State* L)
 {
-   if (!g_lua.touserdata) { g_lua.pushnil(L); return 1; }
-   if (!g_addr->char_array_base || !g_addr->max_chars) { g_lua.pushnil(L); return 1; }
-   if (!g_lua.isnumber(L, 2) || !g_lua.isnumber(L, 3) || !g_lua.isnumber(L, 4)) { g_lua.pushnil(L); return 1; }
+   const auto fn_GameLog = get_gamelog();
+   if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] called\n");
+   if (!g_lua.touserdata) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: touserdata unresolved\n"); g_lua.pushnil(L); return 1; }
+   if (!g_addr->char_array_base || !g_addr->max_chars) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: char array addr missing\n"); g_lua.pushnil(L); return 1; }
+   if (!g_lua.isnumber(L, 2) || !g_lua.isnumber(L, 3) || !g_lua.isnumber(L, 4)) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: args 2/3/4 not numbers\n"); g_lua.pushnil(L); return 1; }
 
    void* beacon        = g_lua.touserdata(L, 1);
    const int   charIndex = g_lua.tointeger(L, 2);
    const float speed     = (float)g_lua.tonumber(L, 3);
    const float radius    = (float)g_lua.tonumber(L, 4);
-   const auto  fn_GameLog = get_gamelog();
-   if (speed <= 0.0f || radius <= 0.0f) { g_lua.pushnil(L); return 1; }
+   if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] char=%d speed=%.1f radius=%.1f beacon=%p\n", charIndex, speed, radius, beacon);
+   if (speed <= 0.0f || radius <= 0.0f) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: bad speed/radius\n"); g_lua.pushnil(L); return 1; }
 
    fn_TeamGetObjInRange tor = os_resolve_tor();
-   if (!tor) { g_lua.pushnil(L); return 1; }
+   if (!tor) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: tor resolve failed (build=%d)\n", (int)g_build); g_lua.pushnil(L); return 1; }
 
    const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
    auto res = [=](uintptr_t a) -> uintptr_t { return a - kUnrelocatedBase + base; };
    const int maxChars = *(int*)res(g_addr->max_chars);
-   if (charIndex < 0 || charIndex >= maxChars) { g_lua.pushnil(L); return 1; }
+   if (charIndex < 0 || charIndex >= maxChars) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: charIndex %d out of range (max %d)\n", charIndex, maxChars); g_lua.pushnil(L); return 1; }
    const uintptr_t arrayBase = *(uintptr_t*)res(g_addr->char_array_base);
-   if (!arrayBase) { g_lua.pushnil(L); return 1; }
+   if (!arrayBase) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: arrayBase null\n"); g_lua.pushnil(L); return 1; }
 
    int killed = 0;
    __try {
       char* slot = (char*)arrayBase + charIndex * layout::Character::kSize;
       uintptr_t ctrl = *(uintptr_t*)(slot + layout::Character::kUnit);
-      if (!ctrl) { g_lua.pushnil(L); return 1; }
+      if (!ctrl) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: ctrl null (char has no unit)\n"); g_lua.pushnil(L); return 1; }
       uintptr_t casterEnt  = ctrl - kOS_CtrlToEnt;
       uint32_t  casterTeam = (*(uint32_t*)(casterEnt + kOS_TeamAndType)) & 0xF;
 
@@ -2267,7 +2269,9 @@ static int lua_GameExt_PlaceBeaconAtAim(lua_State* L)
       eye[0]=*(float*)(ctrl+kOS_CtrlAimStart); eye[1]=*(float*)(ctrl+kOS_CtrlAimStart+4); eye[2]=*(float*)(ctrl+kOS_CtrlAimStart+8);
       dir[0]=*(float*)(ctrl+kOS_CtrlAimDir);   dir[1]=*(float*)(ctrl+kOS_CtrlAimDir+4);   dir[2]=*(float*)(ctrl+kOS_CtrlAimDir+8);
       float dl = sqrtf(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
-      if (dl < 1e-4f) { g_lua.pushnil(L); return 1; }
+      if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] ctrl=%p eye=(%.1f,%.1f,%.1f) rawdir=(%.3f,%.3f,%.3f) dl=%.4f team=%u\n",
+                                 (void*)ctrl, eye[0],eye[1],eye[2], dir[0],dir[1],dir[2], dl, casterTeam);
+      if (dl < 1e-4f) { if (fn_GameLog) fn_GameLog("[PlaceBeaconAtAim] NIL: aim dir ~zero (bad offset 0xE8 on foot?)\n"); g_lua.pushnil(L); return 1; }
       dir[0]/=dl; dir[1]/=dl; dir[2]/=dl;
 
       float vel[3] = { dir[0]*speed, dir[1]*speed + 0.35f*speed, dir[2]*speed };
