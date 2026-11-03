@@ -2520,10 +2520,28 @@ static int lua_GameExt_OrbitalStrikeAt(lua_State* L)
             if (ctrl) casterEnt = ctrl - kOS_CtrlToEnt;
          }
       }
-      killed = os_strike_at(tor, pos, radius, team, casterEnt);
+      // Prefer the caster entity's own team (the path proven by OrbitalStrike);
+      // the Lua-supplied team is only the fallback when the unit is gone.
+      uint32_t useTeam = team;
+      if (casterEnt) useTeam = (*(uint32_t*)(casterEnt + kOS_TeamAndType)) & 0xF;
+
+      // Diagnostic census of what the query sees before striking.
+      static uintptr_t probe[128];
+      float q[3] = { pos[0], pos[1], pos[2] };
+      int n = tor(q, radius, probe, 128, nullptr, 0x02, casterEnt);
+      if (n > 128) n = 128;
+      char teams[160]; int tl = 0; teams[0] = 0;
+      for (int i = 0; i < n && tl < (int)sizeof(teams) - 8; i++) {
+         uintptr_t e = probe[i];
+         if (!e) continue;
+         tl += _snprintf_s(teams + tl, sizeof(teams) - tl, _TRUNCATE, "%u:%.0f ",
+                           (*(uint32_t*)(e + kOS_TeamAndType)) & 0xF, *(float*)(e + kOS_Health));
+      }
+
+      killed = os_strike_at(tor, pos, radius, useTeam, casterEnt);
       if (fn_GameLog)
-         fn_GameLog("[OrbitalStrikeAt] pos=(%.1f,%.1f,%.1f) r=%.1f team=%u caster=%p killed=%d\n",
-                    pos[0], pos[1], pos[2], radius, team, (void*)casterEnt, killed);
+         fn_GameLog("[OrbitalStrikeAt] pos=(%.1f,%.1f,%.1f) r=%.1f luaTeam=%u entTeam=%u caster=%p found=%d [%s] killed=%d\n",
+                    pos[0], pos[1], pos[2], radius, team, useTeam, (void*)casterEnt, n, teams, killed);
    } __except (EXCEPTION_EXECUTE_HANDLER) {
       if (fn_GameLog) fn_GameLog("[OrbitalStrikeAt] EXCEPTION caught\n");
       g_lua.pushnil(L); return 1;
