@@ -2443,8 +2443,100 @@ static int lua_GameExt_RelocateMatrixToAim(lua_State* L)
    }
 }
 
+// ===========================================================================
+// Thrown-ball stratagem helpers (HD2 style: the ball the player throws is
+// followed by the mission Lua until it settles; the strike happens there).
+//
+// GameExt_MatrixPos(matrix) -> x,y,z | nil
+//   Reads the translation row (+0x30) of a Lua matrix (a copy from
+//   GetEntityMatrix), so Lua can track a moving object's position.
+// GameExt_SetMatrixPos(matrix, x, y, z) -> true | nil
+//   Writes that translation, so Lua can spawn an upright prop (built from the
+//   player's matrix) at a position read from another object.
+// GameExt_OrbitalStrikeAt(x, y, z, radius, team [, charIndex]) -> killed | nil
+//   Kills every damageable enemy (team != 0 and != `team`) within `radius` of
+//   the point. charIndex, when its unit is alive, is excluded from the query.
+// ===========================================================================
+static int lua_GameExt_MatrixPos(lua_State* L)
+{
+   if (!g_lua.touserdata) { g_lua.pushnil(L); return 1; }
+   const float* m = (const float*)g_lua.touserdata(L, 1);
+   if (!m) { g_lua.pushnil(L); return 1; }
+   __try {
+      float x = m[12], y = m[13], z = m[14];
+      if (!(x==x && y==y && z==z)) { g_lua.pushnil(L); return 1; }
+      g_lua.pushnumber(L, x);
+      g_lua.pushnumber(L, y);
+      g_lua.pushnumber(L, z);
+      return 3;
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+      g_lua.pushnil(L); return 1;
+   }
+}
+
+static int lua_GameExt_SetMatrixPos(lua_State* L)
+{
+   if (!g_lua.touserdata) { g_lua.pushnil(L); return 1; }
+   float* m = (float*)g_lua.touserdata(L, 1);
+   if (!m || !g_lua.isnumber(L, 2) || !g_lua.isnumber(L, 3) || !g_lua.isnumber(L, 4)) { g_lua.pushnil(L); return 1; }
+   const float x = (float)g_lua.tonumber(L, 2);
+   const float y = (float)g_lua.tonumber(L, 3);
+   const float z = (float)g_lua.tonumber(L, 4);
+   if (!(x==x && y==y && z==z)) { g_lua.pushnil(L); return 1; }
+   __try {
+      m[12] = x; m[13] = y; m[14] = z;
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+      g_lua.pushnil(L); return 1;
+   }
+   g_lua.pushnumber(L, 1.0f);
+   return 1;
+}
+
+static int lua_GameExt_OrbitalStrikeAt(lua_State* L)
+{
+   const auto fn_GameLog = get_gamelog();
+   for (int i = 1; i <= 5; i++)
+      if (!g_lua.isnumber(L, i)) { g_lua.pushnil(L); return 1; }
+   float pos[3] = { (float)g_lua.tonumber(L, 1), (float)g_lua.tonumber(L, 2), (float)g_lua.tonumber(L, 3) };
+   const float    radius = (float)g_lua.tonumber(L, 4);
+   const uint32_t team   = (uint32_t)g_lua.tointeger(L, 5) & 0xF;
+   if (!(pos[0]==pos[0] && pos[1]==pos[1] && pos[2]==pos[2]) || radius <= 0.0f) { g_lua.pushnil(L); return 1; }
+
+   fn_TeamGetObjInRange tor = os_resolve_tor();
+   if (!tor) { if (fn_GameLog) fn_GameLog("[OrbitalStrikeAt] tor resolve FAILED\n"); g_lua.pushnil(L); return 1; }
+
+   int killed = 0;
+   __try {
+      uintptr_t casterEnt = 0;
+      if (g_lua.isnumber(L, 6) && g_addr->char_array_base && g_addr->max_chars) {
+         const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+         auto res = [=](uintptr_t a) -> uintptr_t { return a - kUnrelocatedBase + base; };
+         const int charIndex = g_lua.tointeger(L, 6);
+         const int maxChars  = *(int*)res(g_addr->max_chars);
+         const uintptr_t arrayBase = *(uintptr_t*)res(g_addr->char_array_base);
+         if (arrayBase && charIndex >= 0 && charIndex < maxChars) {
+            char* slot = (char*)arrayBase + charIndex * layout::Character::kSize;
+            uintptr_t ctrl = *(uintptr_t*)(slot + layout::Character::kUnit);
+            if (ctrl) casterEnt = ctrl - kOS_CtrlToEnt;
+         }
+      }
+      killed = os_strike_at(tor, pos, radius, team, casterEnt);
+      if (fn_GameLog)
+         fn_GameLog("[OrbitalStrikeAt] pos=(%.1f,%.1f,%.1f) r=%.1f team=%u caster=%p killed=%d\n",
+                    pos[0], pos[1], pos[2], radius, team, (void*)casterEnt, killed);
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+      if (fn_GameLog) fn_GameLog("[OrbitalStrikeAt] EXCEPTION caught\n");
+      g_lua.pushnil(L); return 1;
+   }
+   g_lua.pushnumber(L, (float)killed);
+   return 1;
+}
+
 static const lua_func_entry custom_functions[] = {
    { "GameExt_KeyDown",         lua_GameExt_KeyDown },
+   { "GameExt_MatrixPos",       lua_GameExt_MatrixPos },
+   { "GameExt_SetMatrixPos",    lua_GameExt_SetMatrixPos },
+   { "GameExt_OrbitalStrikeAt", lua_GameExt_OrbitalStrikeAt },
    { "GameExt_RelocateMatrixToAim", lua_GameExt_RelocateMatrixToAim },
    { "GameExt_SuppressMovement", lua_GameExt_SuppressMovement },
    { "GameExt_SetHudEvent",     lua_GameExt_SetHudEvent },
