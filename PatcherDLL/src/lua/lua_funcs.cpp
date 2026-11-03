@@ -2026,7 +2026,22 @@ bool os_place_prop_at(void* entity, const float pos[3], const float nearRef[3])
    __try { m[12] = pos[0]; m[13] = pos[1]; m[14] = pos[2]; }
    __except (EXCEPTION_EXECUTE_HANDLER) { if (fn_log) fn_log("[os_place_prop_at] write +0xF0 FAULT\n"); return false; }
 
-   // Teleport for real: re-insert into the collision tree from the new matrix, so
+   // Move the collision-sphere CENTRE cache too. UpdateTreeGrid re-inserts from
+   // this slot (stackPtr+(idx+4)*16, exactly what os_entity_pos reads), NOT from
+   // the matrix -- so without this it would just re-bucket the stale feet position.
+   __try {
+      uintptr_t stackPtr = *(uintptr_t*)((char*)entity + kOS_TgoStackPtr);
+      if (stackPtr) {
+         int idx = *(int*)((char*)entity + kOS_TgoStackIdx);
+         float* sp = (float*)(stackPtr + (idx + 4) * 16);
+         sp[0] = pos[0]; sp[1] = pos[1]; sp[2] = pos[2];
+      } else {
+         float* sp = (float*)((char*)entity + kOS_TgoInline);
+         sp[0] = pos[0]; sp[1] = pos[1]; sp[2] = pos[2];
+      }
+   } __except (EXCEPTION_EXECUTE_HANDLER) { if (fn_log) fn_log("[os_place_prop_at] sphere write FAULT\n"); }
+
+   // Teleport for real: re-insert into the collision tree from the new centre, so
    // the render/collision follow (the matrix write alone moves nothing visible).
    os_update_tree_grid(entity);
    if (fn_log) {
