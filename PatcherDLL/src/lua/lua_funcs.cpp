@@ -2376,8 +2376,73 @@ static int lua_GameExt_PlaceBeaconAtAim(lua_State* L)
    return 1;
 }
 
+// ===========================================================================
+// GameExt_RelocateMatrixToAim(matrix, charIndex, throwSpeed [, lift]) -> x,y,z | nil
+//   matrix: a Lua matrix (e.g. from GetEntityMatrix) whose TRANSLATION this
+//   overwrites with the ballistic landing of the caster's aim. The caller then
+//   passes the SAME matrix to CreateEntity, so the prop is BORN at the landing
+//   (its render node is baked at spawn; moving a prop after spawn does not move
+//   its render -- proven: matrix+sphere+UpdateTreeGrid move collision only).
+//   Returns the landing x,y,z, or nil on failure. (lift raises the spawn Y.)
+// ===========================================================================
+static int lua_GameExt_RelocateMatrixToAim(lua_State* L)
+{
+   const auto fn_GameLog = get_gamelog();
+   if (!g_lua.touserdata) { g_lua.pushnil(L); return 1; }
+   if (!g_addr->char_array_base || !g_addr->max_chars) { g_lua.pushnil(L); return 1; }
+   if (!g_lua.isnumber(L, 2) || !g_lua.isnumber(L, 3)) { g_lua.pushnil(L); return 1; }
+
+   void* mtxUser       = g_lua.touserdata(L, 1);
+   const int   charIndex = g_lua.tointeger(L, 2);
+   const float speed     = (float)g_lua.tonumber(L, 3);
+   const float lift      = g_lua.isnumber(L, 4) ? (float)g_lua.tonumber(L, 4) : 0.0f;
+   if (!mtxUser || speed <= 0.0f) { if (fn_GameLog) fn_GameLog("[RelocateMatrixToAim] NIL: bad matrix/speed\n"); g_lua.pushnil(L); return 1; }
+
+   const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+   auto res = [=](uintptr_t a) -> uintptr_t { return a - kUnrelocatedBase + base; };
+   const int maxChars = *(int*)res(g_addr->max_chars);
+   if (charIndex < 0 || charIndex >= maxChars) { g_lua.pushnil(L); return 1; }
+   const uintptr_t arrayBase = *(uintptr_t*)res(g_addr->char_array_base);
+   if (!arrayBase) { g_lua.pushnil(L); return 1; }
+
+   __try {
+      char* slot = (char*)arrayBase + charIndex * layout::Character::kSize;
+      uintptr_t ctrl = *(uintptr_t*)(slot + layout::Character::kUnit);
+      if (!ctrl) { g_lua.pushnil(L); return 1; }
+      uintptr_t casterEnt = ctrl - kOS_CtrlToEnt;
+
+      float eye[3], dir[3];
+      eye[0]=*(float*)(ctrl+kOS_CtrlAimStart); eye[1]=*(float*)(ctrl+kOS_CtrlAimStart+4); eye[2]=*(float*)(ctrl+kOS_CtrlAimStart+8);
+      dir[0]=*(float*)(ctrl+kOS_CtrlAimDir);   dir[1]=*(float*)(ctrl+kOS_CtrlAimDir+4);   dir[2]=*(float*)(ctrl+kOS_CtrlAimDir+8);
+      float dl = sqrtf(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
+      if (dl < 1e-4f) { if (fn_GameLog) fn_GameLog("[RelocateMatrixToAim] NIL: aim dir ~zero\n"); g_lua.pushnil(L); return 1; }
+      dir[0]/=dl; dir[1]/=dl; dir[2]/=dl;
+
+      float vel[3] = { dir[0]*speed, dir[1]*speed + 0.35f*speed, dir[2]*speed };
+      float land[3];
+      os_ballistic_land(eye, vel, casterEnt, land);
+
+      // PblMatrix is 0x40 bytes, row-major, translation row at +0x30 (float indices
+      // 12/13/14). Validate the current translation is finite before writing.
+      float* m = (float*)mtxUser;
+      float cx = m[12], cy = m[13], cz = m[14];
+      if (!(cx==cx && cy==cy && cz==cz)) { if (fn_GameLog) fn_GameLog("[RelocateMatrixToAim] NIL: matrix trans NaN\n"); g_lua.pushnil(L); return 1; }
+      m[12] = land[0]; m[13] = land[1] + lift; m[14] = land[2];
+      if (fn_GameLog) fn_GameLog("[RelocateMatrixToAim] was=(%.1f,%.1f,%.1f) -> land=(%.1f,%.1f,%.1f) lift=%.1f\n",
+                                 cx,cy,cz, land[0],land[1],land[2], lift);
+      g_lua.pushnumber(L, land[0]);
+      g_lua.pushnumber(L, land[1]);
+      g_lua.pushnumber(L, land[2]);
+      return 3;
+   } __except (EXCEPTION_EXECUTE_HANDLER) {
+      if (fn_GameLog) fn_GameLog("[RelocateMatrixToAim] EXCEPTION\n");
+      g_lua.pushnil(L); return 1;
+   }
+}
+
 static const lua_func_entry custom_functions[] = {
    { "GameExt_KeyDown",         lua_GameExt_KeyDown },
+   { "GameExt_RelocateMatrixToAim", lua_GameExt_RelocateMatrixToAim },
    { "GameExt_SuppressMovement", lua_GameExt_SuppressMovement },
    { "GameExt_SetHudEvent",     lua_GameExt_SetHudEvent },
    { "GameExt_OrbitalStrike",   lua_GameExt_OrbitalStrike },
