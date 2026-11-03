@@ -2115,6 +2115,34 @@ void os_entity_pos(uintptr_t entity, float out[3])
 constexpr unsigned kOS_CtrlAimStart = 0xDC;   // PblVector3 eye position
 constexpr unsigned kOS_CtrlAimDir   = 0xE8;   // PblVector3 aim direction
 
+// Straight aim raycast: where the CROSSHAIR points. Reads eye+dir from the
+// controllable, casts a straight ray (world mask 0x90, no soldiers) and returns
+// the first world hit backed off `backoff` units toward the shooter so a surface
+// hit sits in FRONT of the wall/ground instead of embedded in it. This is "where
+// you aim" -- unlike the ballistic arc, which lobs up and lands higher. Returns
+// true and fills `out`; false if the aim dir is unusable.
+bool os_aim_land(uintptr_t ctrl, uintptr_t casterEnt, float backoff, float out[3])
+{
+   float eye[3], dir[3];
+   eye[0]=*(float*)(ctrl+kOS_CtrlAimStart); eye[1]=*(float*)(ctrl+kOS_CtrlAimStart+4); eye[2]=*(float*)(ctrl+kOS_CtrlAimStart+8);
+   dir[0]=*(float*)(ctrl+kOS_CtrlAimDir);   dir[1]=*(float*)(ctrl+kOS_CtrlAimDir+4);   dir[2]=*(float*)(ctrl+kOS_CtrlAimDir+8);
+   float dl = sqrtf(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
+   if (dl < 1e-4f) return false;
+   dir[0]/=dl; dir[1]/=dl; dir[2]/=dl;
+   // Start 2u out so the ray clears the shooter's own body.
+   float start[3] = { eye[0]+dir[0]*2.0f, eye[1]+dir[1]*2.0f, eye[2]+dir[2]*2.0f };
+   const float kMaxDist = 500.0f;
+   void* outHit = nullptr;
+   void* exclude[1] = { (void*)casterEnt };
+   float frac = engine_ray_hit(start, dir, kMaxDist, &outHit, exclude, 1, 0x90);
+   float dist = (outHit && frac < 1.0f) ? frac * kMaxDist : kMaxDist;
+   float hit = dist - backoff; if (hit < 0.0f) hit = 0.0f;
+   out[0] = start[0] + dir[0]*hit;
+   out[1] = start[1] + dir[1]*hit;
+   out[2] = start[2] + dir[2]*hit;
+   return true;
+}
+
 // Kill every enemy (team != 0, != excludeTeam) within `radius` of `pos`, using the
 // engine spatial query + Damageable::Kill. Returns how many were killed.
 int os_strike_at(fn_TeamGetObjInRange tor, const float pos[3], float radius,
@@ -2263,33 +2291,15 @@ static int lua_GameExt_OrbitalStrikeAimed(lua_State* L)
       if (!ctrl) { g_lua.pushnil(L); return 1; }
       uintptr_t casterEnt  = ctrl - kOS_CtrlToEnt;
       uint32_t  casterTeam = (*(uint32_t*)(casterEnt + kOS_TeamAndType)) & 0xF;
+      (void)speed;   // strike at the straight aim point now, not a ballistic throw
 
-      float eye[3], dir[3];
-      eye[0] = *(float*)(ctrl + kOS_CtrlAimStart);
-      eye[1] = *(float*)(ctrl + kOS_CtrlAimStart + 4);
-      eye[2] = *(float*)(ctrl + kOS_CtrlAimStart + 8);
-      dir[0] = *(float*)(ctrl + kOS_CtrlAimDir);
-      dir[1] = *(float*)(ctrl + kOS_CtrlAimDir + 4);
-      dir[2] = *(float*)(ctrl + kOS_CtrlAimDir + 8);
-      float dl = sqrtf(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
-      if (dl < 1e-4f) { g_lua.pushnil(L); return 1; }
-      dir[0]/=dl; dir[1]/=dl; dir[2]/=dl;
-
-      // Launch velocity: aim direction * speed, plus a small upward lob so a
-      // level aim still arcs out instead of hugging the ground.
-      float vel[3] = { dir[0]*speed, dir[1]*speed + 0.35f*speed, dir[2]*speed };
       float land[3];
-      os_ballistic_land(eye, vel, casterEnt, land);
+      if (!os_aim_land(ctrl, casterEnt, 2.0f, land)) { g_lua.pushnil(L); return 1; }
 
       killed = os_strike_at(tor, land, radius, casterTeam, casterEnt);
-      if (fn_GameLog) {
-         float dx = land[0]-eye[0], dz = land[2]-eye[2];
-         float horiz = sqrtf(dx*dx + dz*dz);
-         fn_GameLog("[OrbitalStrikeAimed] team=%u eye=(%.1f,%.1f,%.1f) dir=(%.2f,%.2f,%.2f) "
-                    "land=(%.1f,%.1f,%.1f) throwDist=%.1f killed=%d\n",
-                    casterTeam, eye[0],eye[1],eye[2], dir[0],dir[1],dir[2],
-                    land[0],land[1],land[2], horiz, killed);
-      }
+      if (fn_GameLog)
+         fn_GameLog("[OrbitalStrikeAimed] team=%u land=(%.1f,%.1f,%.1f) killed=%d\n",
+                    casterTeam, land[0],land[1],land[2], killed);
    } __except (EXCEPTION_EXECUTE_HANDLER) {
       if (fn_GameLog) fn_GameLog("[OrbitalStrikeAimed] EXCEPTION caught\n");
       g_lua.pushnil(L); return 1;
@@ -2410,17 +2420,10 @@ static int lua_GameExt_RelocateMatrixToAim(lua_State* L)
       uintptr_t ctrl = *(uintptr_t*)(slot + layout::Character::kUnit);
       if (!ctrl) { g_lua.pushnil(L); return 1; }
       uintptr_t casterEnt = ctrl - kOS_CtrlToEnt;
+      (void)speed;   // landing is the straight aim point now, not a ballistic throw
 
-      float eye[3], dir[3];
-      eye[0]=*(float*)(ctrl+kOS_CtrlAimStart); eye[1]=*(float*)(ctrl+kOS_CtrlAimStart+4); eye[2]=*(float*)(ctrl+kOS_CtrlAimStart+8);
-      dir[0]=*(float*)(ctrl+kOS_CtrlAimDir);   dir[1]=*(float*)(ctrl+kOS_CtrlAimDir+4);   dir[2]=*(float*)(ctrl+kOS_CtrlAimDir+8);
-      float dl = sqrtf(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
-      if (dl < 1e-4f) { if (fn_GameLog) fn_GameLog("[RelocateMatrixToAim] NIL: aim dir ~zero\n"); g_lua.pushnil(L); return 1; }
-      dir[0]/=dl; dir[1]/=dl; dir[2]/=dl;
-
-      float vel[3] = { dir[0]*speed, dir[1]*speed + 0.35f*speed, dir[2]*speed };
       float land[3];
-      os_ballistic_land(eye, vel, casterEnt, land);
+      if (!os_aim_land(ctrl, casterEnt, 2.0f, land)) { if (fn_GameLog) fn_GameLog("[RelocateMatrixToAim] NIL: aim dir ~zero\n"); g_lua.pushnil(L); return 1; }
 
       // PblMatrix is 0x40 bytes, row-major, translation row at +0x30 (float indices
       // 12/13/14). Validate the current translation is finite before writing.
