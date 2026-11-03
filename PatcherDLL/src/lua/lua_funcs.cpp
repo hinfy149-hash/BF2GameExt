@@ -748,7 +748,15 @@ static int lua_SetCharacterWeapon(lua_State* L)
       // unit simply keeps its old weapon.
       int32_t newMap = -1;
       __try { newMap = *(int32_t*)(newWpn + layout::Weapon::kSoldierAnimationMap); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-      if (newMap == -1) {
+      // Offhand weapons (grenades, dispensers) legitimately have no animmap: the
+      // stock thermal detonator in the secondary channel already lives with
+      // MAP = -1. Only refuse when the weapon we replace HAS a map, i.e. when
+      // we would take a working animation away from the slot.
+      int32_t oldMap = 0;
+      __try { oldMap = *(int32_t*)(oldWpn + layout::Weapon::kSoldierAnimationMap); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+      fn_GameLog("SetCharacterWeapon: '%s' newMap=%d oldMap=%d channel=%d\n",
+                 targetOdf, newMap, oldMap, channel);
+      if (newMap == -1 && oldMap != -1) {
          __try {
             typedef void (__thiscall* WpnDelete_t)(uintptr_t w, uint32_t flags);
             ((WpnDelete_t)(**(uintptr_t**)newWpn))(newWpn, 1);
